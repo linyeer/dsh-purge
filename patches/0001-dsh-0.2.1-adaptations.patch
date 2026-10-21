@@ -1,0 +1,139 @@
+diff --git a/cordis.patch.yml b/cordis.patch.yml
+index cecf56e..bcd7285 100644
+--- a/cordis.patch.yml
++++ b/cordis.patch.yml
+@@ -28,7 +28,7 @@
+   config:
+     includeHarnessIdentity: false
+     personaPrefix: ""
+-    personaSuffix: Your working directory is {{cwd}}.
++    personaSuffix: ""
+ 
+ - id: dsh-purge
+   inject: [systemPrompt, tools]
+diff --git a/lib/core.js b/lib/core.js
+index c82b473..a163c56 100644
+--- a/lib/core.js
++++ b/lib/core.js
+@@ -2483,6 +2483,27 @@ const COMPLETE_PROMPT_WATERFALL_INJECT =
+   "\t\t\tcontexts: runtimeContextSuppressed ? [] : transformed.contexts\n" +
+   "\t\t};";
+ 
++/**
++ * 0.2.1 的 assemble() 在 waterfall 之后多算了一份 requiredContexts，contexts 收窄成
++ * "runtimeContextSuppressed ? 只留 required : 全留"。这一段必须原样保留，
++ * 否则 runtime context 的抑制语义会被改掉。
++ */
++const COMPLETE_PROMPT_WATERFALL_INJECT_021 =
++  "\t\tconst transformed = await this.ctx.waterfall(scopeTarget(this, scope), \"system-prompt/assemble\", assembly, context, () => Promise.resolve(assembly));\n" +
++  "\t\tconst dshPurgeSections = (transformed.sections || []).filter((s) => String(s && s.name || \"\").startsWith(\"dsh-purge\") && String(s.text || \"\").length > 0);\n" +
++  "\t\tconst dshPurgeRest = (transformed.sections || []).filter((s) => !String(s && s.name || \"\").startsWith(\"dsh-purge\"));\n" +
++  "\t\tif (completeSection === void 0 && !runtimeContextSuppressed) return { ...transformed, sections: [...dshPurgeSections, ...dshPurgeRest] }; // [dsh-purge] every mode keeps system inject\n" +
++  "\t\tconst requiredContexts = new Set([...contextByName.values()].filter((entry) => entry.required === true).map((entry) => entry.name));\n" +
++  "\t\treturn {\n" +
++  "\t\t\t...transformed,\n" +
++  "\t\t\tsections: completeSection === void 0 ? [...dshPurgeSections, ...dshPurgeRest] : (function (complete, purge, rest) {\n" +
++  "\t\t\t\tconst base = { ...complete };\n" +
++  "\t\t\t\tconst tail = rest.filter((s) => String(s?.name || \"\") !== String(base.name || \"\"));\n" +
++  "\t\t\t\treturn [...purge, ...tail, base]; // [dsh-purge] complete prompt keeps inject + agent-instructions\n" +
++  "\t\t\t})(completeSection, dshPurgeSections, dshPurgeRest),\n" +
++  "\t\t\tcontexts: runtimeContextSuppressed ? transformed.contexts.filter((entry) => requiredContexts.has(entry.name)) : transformed.contexts\n" +
++  "\t\t};";
++
+ function clearShellNetworkBan(pattern) {
+   return pattern
+     .replace(/\n[ \t]+\* You don't have access to the internet via this tool\./, "")
+@@ -3906,6 +3927,22 @@ const NEW_TOOL_PATCHES = [
+           "\t\t};",
+         replace: COMPLETE_PROMPT_WATERFALL_INJECT,
+       },
++      {
++        // 0.2.1：assemble() 里多了 requiredContexts，sections 也换成 transformed.sections。
++        // 少了这一条，#40 在 0.2.1 上全部 pattern 落空 → 状态变 skipped →
++        // 但 hostCleanMarkersPresent 仍要求 complete prompt keeps inject 标记 →
++        // 「应用」判「清洗没有写进全部宿主」并取消重启。
++        pattern:
++          "\t\tconst transformed = await this.ctx.waterfall(scopeTarget(this, scope), \"system-prompt/assemble\", assembly, context, () => Promise.resolve(assembly));\n" +
++          "\t\tif (completeSection === void 0 && !runtimeContextSuppressed) return transformed;\n" +
++          "\t\tconst requiredContexts = new Set([...contextByName.values()].filter((entry) => entry.required === true).map((entry) => entry.name));\n" +
++          "\t\treturn {\n" +
++          "\t\t\t...transformed,\n" +
++          "\t\t\tsections: completeSection === void 0 ? transformed.sections : [completeSection],\n" +
++          "\t\t\tcontexts: runtimeContextSuppressed ? transformed.contexts.filter((entry) => requiredContexts.has(entry.name)) : transformed.contexts\n" +
++          "\t\t};",
++        replace: COMPLETE_PROMPT_WATERFALL_INJECT_021,
++      },
+     ],
+     forbid: ["dsh-purge:committed"],
+     markersAny: true,
+diff --git a/lib/identity.js b/lib/identity.js
+index 2fea3dc..f2e992f 100644
+--- a/lib/identity.js
++++ b/lib/identity.js
+@@ -5,10 +5,12 @@ export const OBJECTIVE_SECTION = "dshpg-objective";
+ export const REDTEAM_ROLE_SECTION = "dshpg-redteam-role";
+ export { CAPABILITY_SECTION, capabilityProtocolText };
+ export const IDENTITY_CARD_PREFIX = "WHO YOU ARE (highest priority";
+-export const CWD_ONLY_SUFFIX = "Your working directory is {{cwd}}.";
++// 0.2.1 起宿主不再注册 {{cwd}}，personaSuffix 带它会让整轮组装失败。
++// 工作目录由 working-directory 服务以普通上下文提供。
++export const CWD_ONLY_SUFFIX = "";
+ export { PHASE1_KEEP_EXPR, widenPhase1KeepFilter } from "./phase1-keep.js";
+ 
+-const DSH_INTERPOLATE_ALLOWED = new Set(["cwd", "model", "provider"]);
++const DSH_INTERPOLATE_ALLOWED = new Set(["model", "provider"]);
+ 
+ /** 插件自己的段：inject 用 dsh-purge*，cap/卡/角色用 dshpg-* 以免被挪到 inject 前。 */
+ export function isPluginPromptSection(name) {
+@@ -17,7 +19,7 @@ export function isPluginPromptSection(name) {
+ }
+ 
+ /**
+- * DSH interpolate 只认 cwd/model/provider。其它 `{{` 会抛 malformed，整段丢掉。
++ * 0.2.1 宿主只注册 model/provider，其它 `{{` 会抛 unknown/malformed，整轮请求失败。
+  * 正文不改文件，只在线上把非法 `{{` 拆成 `{ {`。
+  */
+ export function escapeDshInterpolation(text) {
+@@ -153,7 +155,7 @@ function stripHarnessPersona(text) {
+     .replace(OLD_IDENTITY_LOCK, "")
+     .replace(
+       /You are a coding agent powered by the \{\{model\}\} model, running on the DeepSeek Harness\. Your working directory is \{\{cwd\}\}\.?\s*/g,
+-      "Working directory: {{cwd}}. ",
++      "",
+     )
+     .replace(
+       /You are a coding agent powered by the \{\{model\}\} model, running on the DeepSeek Harness\.?\s*/g,
+@@ -161,7 +163,7 @@ function stripHarnessPersona(text) {
+     )
+     .replace(
+       /You are a coding agent powered by the \{\{model\}\} model\. Your working directory is \{\{cwd\}\}\.?\s*/g,
+-      "Working directory: {{cwd}}. ",
++      "",
+     )
+     .replace(
+       /The DeepSeek Harness implementation checkout is at [\s\S]*?Use this checkout only to inspect or extend DSH itself\.?\s*/g,
+@@ -176,6 +178,7 @@ function stripHarnessPersona(text) {
+     .replace(/You are Claude,?[^\n]*/g, "")
+     .replace(/我是 Claude[^\n]*/g, "")
+     .replace(/由 Anthropic 开发[^\n]*/g, "")
++    .replace(/\b(?:Your working directory is|Working directory:)\s*\{\{cwd\}\}\.?\s*/g, "")
+     .replace(/[ \t]{2,}/g, " ")
+     .replace(/ \n/g, "\n")
+     .trim();
+@@ -202,6 +205,7 @@ function isHardcodedExecRule(section) {
+ function isCwdOnlyText(text) {
+   const t = String(text || "").trim();
+   return t === CWD_ONLY_SUFFIX
++    || t === "Your working directory is {{cwd}}."
+     || t === "Working directory: {{cwd}}."
+     || t === "Working directory: {{cwd}}";
+ }
+@@ -241,7 +245,7 @@ export function overlayOfficialIdentity(sections) {
+     }
+     out.push(section);
+   }
+-  if (!sawSuffix) {
++  if (!sawSuffix && CWD_ONLY_SUFFIX) {
+     out.push({
+       name: "deployment:persona-suffix",
+       text: CWD_ONLY_SUFFIX,
